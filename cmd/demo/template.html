@@ -1,0 +1,815 @@
+<!doctype html>
+<html lang="zh-CN" data-theme="dark">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>双流窗口 Join · Watermark 与迟到侧输出逐帧回放</title>
+<script>
+// 在首帧绘制前确定主题（?theme=light|dark，否则跟随系统）。
+(function () {
+  var p = new URLSearchParams(location.search).get('theme');
+  var t = p === 'light' || p === 'dark' ? p
+    : (matchMedia('(prefers-color-scheme: light)').matches ? 'light' : 'dark');
+  document.documentElement.dataset.theme = t;
+})();
+</script>
+<style>
+  :root {
+    color-scheme: light;
+    --page: #f9f9f7;
+    --surface: #fcfcfb;
+    --surface-2: #f0efec;
+    --ink: #0b0b0b;
+    --ink-2: #52514e;
+    --muted: #898781;
+    --grid: #e1e0d9;
+    --baseline: #c3c2b7;
+    --ring: rgba(11, 11, 11, 0.10);
+    --left: #2a78d6;
+    --right: #eb6834;
+    --wm: #4a3aa7;
+    --good: #0ca30c;
+    --critical: #d03b3b;
+    --critical-soft: rgba(208, 59, 59, 0.10);
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      color-scheme: dark;
+      --page: #0d0d0d;
+      --surface: #1a1a19;
+      --surface-2: #242422;
+      --ink: #ffffff;
+      --ink-2: #c3c2b7;
+      --muted: #898781;
+      --grid: #2c2c2a;
+      --baseline: #383835;
+      --ring: rgba(255, 255, 255, 0.10);
+      --left: #3987e5;
+      --right: #d95926;
+      --wm: #9085e9;
+      --good: #0ca30c;
+      --critical: #e66767;
+      --critical-soft: rgba(230, 103, 103, 0.14);
+    }
+  }
+  :root[data-theme="dark"] {
+    color-scheme: dark;
+    --page: #0d0d0d;
+    --surface: #1a1a19;
+    --surface-2: #242422;
+    --ink: #ffffff;
+    --ink-2: #c3c2b7;
+    --muted: #898781;
+    --grid: #2c2c2a;
+    --baseline: #383835;
+    --ring: rgba(255, 255, 255, 0.10);
+    --left: #3987e5;
+    --right: #d95926;
+    --wm: #9085e9;
+    --good: #0ca30c;
+    --critical: #e66767;
+    --critical-soft: rgba(230, 103, 103, 0.14);
+  }
+
+  * { box-sizing: border-box; }
+  html, body { margin: 0; padding: 0; }
+  body {
+    background: var(--page);
+    color: var(--ink);
+    font: 14px/1.55 system-ui, -apple-system, "Segoe UI", "PingFang SC",
+          "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
+    -webkit-font-smoothing: antialiased;
+  }
+  .app { max-width: 1120px; margin: 0 auto; padding: 24px 16px 48px; }
+
+  header.page { display: flex; align-items: flex-start; justify-content: space-between; gap: 16px; flex-wrap: wrap; }
+  h1 { font-size: 20px; margin: 0 0 4px; letter-spacing: .2px; }
+  .sub { color: var(--ink-2); font-size: 13px; margin: 0; }
+  .theme-btn {
+    border: 1px solid var(--ring); background: var(--surface); color: var(--ink-2);
+    border-radius: 8px; padding: 7px 12px; font-size: 13px; cursor: pointer;
+  }
+  .theme-btn:hover { color: var(--ink); }
+
+  .stats { display: grid; grid-template-columns: repeat(4, 1fr); gap: 10px; margin: 18px 0 14px; }
+  .stat {
+    background: var(--surface); border: 1px solid var(--ring); border-radius: 10px;
+    padding: 10px 14px;
+  }
+  .stat .k { font-size: 12px; color: var(--ink-2); }
+  .stat .v { font-size: 22px; font-weight: 650; margin-top: 2px; font-variant-numeric: tabular-nums; }
+  .stat .v small { font-size: 12px; font-weight: 400; color: var(--muted); margin-left: 2px; }
+  .stat.alert .v { color: var(--critical); }
+
+  .card {
+    background: var(--surface); border: 1px solid var(--ring); border-radius: 12px;
+    padding: 14px 16px; margin-top: 14px;
+  }
+  .card.chart-card { padding: 12px 10px 6px; transition: border-color .25s, box-shadow .25s; }
+  .card.chart-card.is-late {
+    border-color: var(--critical);
+    box-shadow: 0 0 0 3px var(--critical-soft);
+  }
+
+  .legend { display: flex; flex-wrap: wrap; gap: 8px 18px; padding: 2px 8px 8px; font-size: 12.5px; color: var(--ink-2); }
+  .legend span { display: inline-flex; align-items: center; gap: 7px; }
+  .swatch { width: 12px; height: 12px; border-radius: 50%; display: inline-block; }
+  .swatch.l { background: var(--left); }
+  .swatch.r { background: var(--right); }
+  .swatch.line { height: 0; border-top: 3px dashed var(--wm); border-radius: 0; width: 18px; }
+  .swatch.pair { height: 0; border-top: 2px solid var(--baseline); border-radius: 0; width: 18px; }
+  .swatch.late { background: var(--surface); border: 2.5px solid var(--critical); }
+
+  .late-banner {
+    display: none; margin: 0 8px 6px; padding: 8px 12px; border-radius: 8px;
+    background: var(--critical-soft); color: var(--critical); font-weight: 650;
+    font-size: 13.5px; align-items: center; gap: 8px;
+  }
+  .late-banner.show { display: flex; animation: flash .5s ease; }
+  @keyframes flash { from { opacity: 0; transform: translateY(-4px); } to { opacity: 1; transform: none; } }
+
+  svg { width: 100%; height: auto; display: block; }
+
+  .controls { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin-top: 2px; }
+  .btn {
+    border: 1px solid var(--ring); background: var(--surface); color: var(--ink);
+    border-radius: 8px; min-width: 38px; padding: 8px 12px; font-size: 14px; cursor: pointer;
+  }
+  .btn.primary { background: var(--left); border-color: transparent; color: #fff; min-width: 72px; font-weight: 600; }
+  .btn:hover { filter: brightness(1.06); }
+  input[type=range] { flex: 1 1 220px; accent-color: var(--left); }
+  .frame-label { font-variant-numeric: tabular-nums; color: var(--ink-2); font-size: 13px; min-width: 74px; text-align: center; }
+  select {
+    border: 1px solid var(--ring); background: var(--surface); color: var(--ink);
+    border-radius: 8px; padding: 7px 8px; font-size: 13px;
+  }
+
+  .grid { display: grid; grid-template-columns: 1.25fr 1fr 1fr; gap: 14px; margin-top: 14px; align-items: start; }
+  .panel { background: var(--surface); border: 1px solid var(--ring); border-radius: 12px; padding: 14px 16px; }
+  .panel h2 { font-size: 13px; margin: 0 0 10px; color: var(--ink-2); font-weight: 650; text-transform: none; letter-spacing: .3px; display: flex; justify-content: space-between; }
+  .panel h2 em { font-style: normal; color: var(--muted); font-weight: 400; }
+
+  .narrative .frame-title { font-weight: 650; font-size: 15px; margin-bottom: 8px; }
+  .row { display: flex; gap: 8px; align-items: baseline; margin: 6px 0; font-size: 13.5px; }
+  .row .tag { flex: 0 0 64px; color: var(--muted); font-size: 12px; }
+  .badge { display: inline-block; font-size: 11px; border-radius: 5px; padding: 1px 7px; margin-left: 6px; vertical-align: 1px; }
+  .badge.adv { background: color-mix(in srgb, var(--wm) 16%, transparent); color: var(--wm); font-weight: 650; }
+  .badge.stay { background: var(--surface-2); color: var(--muted); }
+  .badge.late { background: var(--critical-soft); color: var(--critical); font-weight: 650; }
+  .late-box {
+    margin-top: 10px; border: 1px solid color-mix(in srgb, var(--critical) 45%, transparent);
+    background: var(--critical-soft); color: var(--critical); border-radius: 8px;
+    padding: 9px 12px; font-size: 13px; font-weight: 600;
+  }
+  .close-box {
+    margin-top: 8px; border: 1px solid var(--ring); border-left: 3px solid var(--good);
+    background: var(--surface-2); border-radius: 8px; padding: 8px 12px; font-size: 13px;
+  }
+  code, .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-variant-numeric: tabular-nums; }
+
+  .chips { display: flex; flex-wrap: wrap; gap: 6px; }
+  .chip {
+    display: inline-flex; align-items: center; gap: 5px; border-radius: 7px;
+    padding: 3px 9px; font-size: 12.5px; border: 1px solid var(--ring);
+    background: var(--surface-2); animation: pop .3s ease; font-variant-numeric: tabular-nums;
+  }
+  .chip .dot { width: 8px; height: 8px; border-radius: 50%; }
+  .chip .dot.L { background: var(--left); }
+  .chip .dot.R { background: var(--right); }
+  .chip.late { color: var(--critical); border-color: color-mix(in srgb, var(--critical) 45%, transparent); background: var(--critical-soft); }
+  .chip.result { border-left: 3px solid var(--good); }
+  @keyframes pop { from { opacity: 0; transform: scale(.85); } to { opacity: 1; transform: none; } }
+
+  .win-card { border: 1px solid var(--ring); border-radius: 9px; padding: 9px 11px; margin-bottom: 8px; background: var(--surface); }
+  .win-card.closed { opacity: .72; background: var(--surface-2); }
+  .win-head { display: flex; justify-content: space-between; font-size: 13px; font-weight: 600; margin-bottom: 6px; }
+  .win-head .st { font-weight: 600; font-size: 11.5px; color: var(--ink-2); display: inline-flex; gap: 4px; align-items: center; }
+  .win-head .st.closed { color: var(--good); }
+  .win-line { font-size: 12px; color: var(--ink-2); margin: 3px 0; display: flex; gap: 6px; align-items: center; flex-wrap: wrap; }
+  .win-line .lbl { flex: 0 0 44px; color: var(--muted); }
+  .pairline { font-size: 12px; color: var(--muted); margin-top: 4px; }
+  .pairline b { color: var(--ink-2); font-weight: 600; }
+  .empty { color: var(--muted); font-size: 12.5px; }
+
+  .framelog { max-height: 260px; overflow-y: auto; display: flex; flex-direction: column; gap: 2px; }
+  .fl-item {
+    display: flex; gap: 8px; align-items: baseline; border: none; background: none;
+    text-align: left; font: inherit; color: inherit; cursor: pointer;
+    padding: 5px 8px; border-radius: 7px; font-size: 12.5px; width: 100%;
+  }
+  .fl-item:hover { background: var(--surface-2); }
+  .fl-item.cur { background: color-mix(in srgb, var(--left) 15%, transparent); }
+  .fl-item.cur.late { background: var(--critical-soft); }
+  .fl-item .n { flex: 0 0 30px; color: var(--muted); font-variant-numeric: tabular-nums; }
+  .fl-item.late { color: var(--critical); }
+  .fl-item .d { color: var(--muted); margin-left: auto; font-variant-numeric: tabular-nums; }
+
+  footer.note { margin-top: 22px; color: var(--ink-2); font-size: 12.5px; line-height: 1.7; }
+  footer.note code { background: var(--surface-2); padding: 1px 5px; border-radius: 4px; }
+
+  /* SVG 元素样式 */
+  .band { fill: var(--surface-2); stroke: none; opacity: .55; }
+  .band.active { opacity: .9; }
+  .band.closed { fill: var(--surface-2); }
+  .band.target { stroke: var(--ink); stroke-width: 1.5; stroke-dasharray: 3 3; }
+  .gridline { stroke: var(--grid); stroke-width: 1; }
+  .axisline { stroke: var(--baseline); stroke-width: 1.5; }
+  .tick-label { fill: var(--muted); font-size: 11px; font-variant-numeric: tabular-nums; }
+  .band-label { fill: var(--ink-2); font-size: 11px; font-weight: 600; font-variant-numeric: tabular-nums; }
+  .lane-label { fill: var(--ink-2); font-size: 11.5px; font-weight: 650; }
+  .ev-circle { stroke: var(--surface); stroke-width: 2; animation: pop .35s ease; }
+  .ev-key { font-size: 11px; font-weight: 700; text-anchor: middle; dominant-baseline: central; }
+  .ev-t { fill: var(--muted); font-size: 10px; text-anchor: middle; font-variant-numeric: tabular-nums; }
+  .ev-circle.late { fill: var(--surface); stroke: var(--critical); stroke-width: 3; }
+  .ev-key.late { fill: var(--critical); }
+  .ev-circle.cur { }
+  .cur-ring { fill: none; stroke: var(--critical); stroke-width: 2; transform-box: fill-box; transform-origin: center; animation: ring 1.1s ease-out infinite; }
+  .cur-ring.normal { stroke: var(--ink); }
+  @keyframes ring { 0% { opacity: .9; transform: scale(1); } 100% { opacity: 0; transform: scale(2.1); } }
+  .pair-line { stroke: var(--baseline); stroke-width: 1.5; fill: none; }
+  .pair-line.open { stroke-dasharray: 4 4; opacity: .8; }
+  .pair-line.emitted { stroke: var(--ink-2); stroke-width: 2; }
+  .wm-g { transition: transform .45s ease; }
+  .wm-line { stroke: var(--wm); stroke-width: 2.2; stroke-dasharray: 6 4; }
+  .wm-tag { fill: var(--wm); font-size: 11.5px; font-weight: 700; font-variant-numeric: tabular-nums; }
+  .rail-line { stroke: var(--critical); stroke-width: 1.5; stroke-dasharray: 2 4; opacity: .7; }
+  .rail-label { fill: var(--critical); font-size: 11px; font-weight: 650; }
+  .rail-chip { fill: var(--critical-soft); stroke: var(--critical); stroke-width: 1; animation: pop .35s ease; }
+  .rail-chip-text { fill: var(--critical); font-size: 10.5px; font-weight: 650; text-anchor: middle; dominant-baseline: central; font-variant-numeric: tabular-nums; }
+  .rail-arrow { stroke: var(--critical); stroke-width: 1.6; fill: none; marker-end: url(#arrowRed); animation: flash .4s ease; }
+  .closed-check { fill: var(--good); font-size: 11px; font-weight: 700; }
+
+  @media (max-width: 860px) {
+    .grid { grid-template-columns: 1fr; }
+    .stats { grid-template-columns: repeat(2, 1fr); }
+  }
+</style>
+</head>
+<body>
+<div class="app">
+  <header class="page">
+    <div>
+      <h1>双流窗口 Join：Watermark 推进与迟到数据侧输出</h1>
+      <p class="sub">事件时间滚动窗口（左闭右开）· 窗口长度 <b class="mono" id="cfg-size"></b>
+        · 最大乱序容忍 <b class="mono" id="cfg-tol"></b> · 共 <b class="mono" id="cfg-frames"></b> 帧</p>
+    </div>
+    <button class="theme-btn" id="theme-btn" type="button">🌙 暗色</button>
+  </header>
+
+  <div class="stats">
+    <div class="stat"><div class="k">当前 Watermark</div><div class="v" id="st-wm">−∞</div></div>
+    <div class="stat"><div class="k">已正式输出 Join 结果</div><div class="v"><span id="st-res">0</span><small>条</small></div></div>
+    <div class="stat" id="stat-late"><div class="k">侧输出（迟到事件）</div><div class="v"><span id="st-late">0</span><small>条</small></div></div>
+    <div class="stat"><div class="k">已关闭窗口</div><div class="v"><span id="st-closed">0</span><small>个</small></div></div>
+  </div>
+
+  <div class="card chart-card" id="chart-card">
+    <div class="late-banner" id="late-banner">⚠ 迟到事件进入侧输出：不丢弃、不重开窗口、不重算已输出结果</div>
+    <div class="legend">
+      <span><i class="swatch l"></i>左流 Left</span>
+      <span><i class="swatch r"></i>右流 Right（圆内为 Key，下方为事件时间 t）</span>
+      <span><i class="swatch line"></i>Watermark</span>
+      <span><i class="swatch pair"></i>同 Key 配对（虚线暂存 / 实线随窗口关闭正式输出）</span>
+      <span><i class="swatch late"></i>迟到 → 侧输出</span>
+    </div>
+    <svg id="chart" viewBox="0 0 1000 292" role="img" aria-label="事件时间轴与 Watermark 回放图"></svg>
+  </div>
+
+  <div class="card">
+    <div class="controls">
+      <button class="btn" id="btn-first" title="第一帧" type="button">⏮</button>
+      <button class="btn" id="btn-prev" title="上一帧（←）" type="button">←</button>
+      <button class="btn primary" id="btn-play" title="播放/暂停（空格）" type="button">▶ 播放</button>
+      <button class="btn" id="btn-next" title="下一帧（→）" type="button">→</button>
+      <button class="btn" id="btn-last" title="最后一帧" type="button">⏭</button>
+      <input type="range" id="slider" min="1" max="18" value="1" aria-label="帧进度">
+      <span class="frame-label" id="frame-label">帧 1 / 18</span>
+      <select id="speed" aria-label="播放速度">
+        <option value="0.5">0.5×</option>
+        <option value="1" selected>1×</option>
+        <option value="2">2×</option>
+        <option value="4">4×</option>
+      </select>
+    </div>
+  </div>
+
+  <div class="grid">
+    <section class="panel narrative">
+      <h2>本帧发生了什么</h2>
+      <div id="narrative"></div>
+    </section>
+    <section class="panel">
+      <h2>窗口状态 <em id="win-count"></em></h2>
+      <div id="windows"></div>
+    </section>
+    <section class="panel">
+      <h2>Join 结果 <em id="res-count"></em></h2>
+      <div class="chips" id="results"></div>
+      <h2 style="margin-top:16px">侧输出 Side Output <em id="late-count"></em></h2>
+      <div class="chips" id="side-output"></div>
+    </section>
+  </div>
+
+  <div class="card">
+    <h2 style="font-size:13px;margin:0 0 8px;color:var(--ink-2)">帧日志（点击跳转）</h2>
+    <div class="framelog" id="framelog"></div>
+  </div>
+
+  <footer class="note">
+    <b>Watermark：</b><code>WM = max(旧WM, 已观察最大事件时间 − 容忍度)</code>，单调不减；
+    当 <code>WM ≥ 窗口 End</code> 时窗口关闭（是 ≥ 不是 &gt;），一次性正式输出窗口内全部同 Key 的左右流配对。<br>
+    <b>乱序 ≠ 迟到：</b>事件时间落后于 Watermark，只要所属窗口尚未关闭就照常缓冲配对；
+    窗口关闭后才到达的事件进入独立<b>侧输出</b>，绝不丢弃、绝不重开窗口重算。<br>
+    键盘：<code>空格</code> 播放/暂停，<code>←</code>/<code>→</code> 单步；URL 参数 <code>?frame=8</code> 定位帧，<code>?theme=light</code> 指定主题。
+  </footer>
+</div>
+
+<script>
+// 回放数据由 cmd/demo 在生成时内嵌（窗口配置 + 18 帧快照）。
+const REPLAY = /*__REPLAY_DATA__*/;
+</script>
+<script>
+(function () {
+  'use strict';
+  const F = REPLAY.frames;
+  const SIZE = REPLAY.windowSize, TOL = REPLAY.tolerance;
+  const N = F.length;
+
+  // ---------- 时间轴几何 ----------
+  const VB_W = 1000, VB_H = 292;
+  const ML = 48, MR = 20, PLOT_W = VB_W - ML - MR;
+  const T_MIN = -3, T_MAX = 48;
+  const x = t => ML + (t - T_MIN) / (T_MAX - T_MIN) * PLOT_W;
+  const LY = 92, RY = 172, BAND_T = 52, BAND_B = 202, RAIL_Y = 240;
+  const SVGNS = 'http://www.w3.org/2000/svg';
+
+  // ---------- 状态 ----------
+  let cur = 0;              // 当前帧下标（0 起）
+  let playing = false;
+  let timer = null;
+  const BASE_MS = 1700;
+
+  const $ = id => document.getElementById(id);
+  const fmtWM = v => (v === null || v === undefined) ? '−∞' : String(v);
+  const wkey = w => '[' + w.start + ',' + w.end + ')';
+
+  // ---------- SVG 辅助 ----------
+  function svgEl(tag, attrs) {
+    const e = document.createElementNS(SVGNS, tag);
+    for (const k in attrs) e.setAttribute(k, attrs[k]);
+    return e;
+  }
+  function pairId(p) { return p.left.seq + '-' + p.right.seq; }
+
+  // 同泳道内时间相近的事件会重叠，用轻量 beeswarm 松弛在 x 方向错开。
+  // 返回 seq -> 实际渲染 x 像素；错开只动位置、不改事件时间语义。
+  function layoutEvents(events) {
+    const lanes = { L: [], R: [] };
+    events.forEach(e => lanes[e.side].push({ seq: e.seq, p: x(e.time) }));
+    const pos = {};
+    Object.values(lanes).forEach(arr => {
+      for (let it = 0; it < 40; it++) {
+        for (let i = 0; i < arr.length; i++) {
+          for (let k = i + 1; k < arr.length; k++) {
+            const a = arr[i], b = arr[k], d = b.p - a.p;
+            if (Math.abs(d) < 25) {
+              const push = (25 - Math.abs(d)) / 2;
+              if (d >= 0) { a.p -= push; b.p += push; }
+              else { a.p += push; b.p -= push; }
+            }
+          }
+        }
+      }
+      arr.forEach(o => { pos[o.seq] = o.p; });
+    });
+    return pos;
+  }
+
+  // ---------- 渲染：时间轴 ----------
+  function renderChart() {
+    const svg = $('chart');
+    svg.innerHTML = '';
+    const f = F[cur];
+
+    // 箭头 marker
+    const defs = svgEl('defs', {});
+    const marker = svgEl('marker', { id: 'arrowRed', viewBox: '0 0 10 10', refX: 8, refY: 5,
+      markerWidth: 7, markerHeight: 7, orient: 'auto-start-reverse' });
+    marker.appendChild(svgEl('path', { d: 'M0,0 L10,5 L0,10 z', fill: 'var(--critical)' }));
+    defs.appendChild(marker);
+    // 关闭窗口的斜线纹理
+    const pat = svgEl('pattern', { id: 'hatch', width: 7, height: 7,
+      patternUnits: 'userSpaceOnUse', patternTransform: 'rotate(45)' });
+    pat.appendChild(svgEl('rect', { width: 7, height: 7, fill: 'var(--surface-2)' }));
+    pat.appendChild(svgEl('line', { x1: 0, y1: 0, x2: 0, y2: 7,
+      stroke: 'var(--baseline)', 'stroke-width': 2, opacity: .55 }));
+    defs.appendChild(pat);
+    svg.appendChild(defs);
+
+    // 窗口带：固定画出 [0,10)…[40,50) 作为上下文
+    const winByStart = {};
+    f.windows.forEach(w => { winByStart[w.window.start] = w; });
+    for (let s = 0; s <= 40; s += SIZE) {
+      const w = winByStart[s];
+      const g = svgEl('g', {});
+      const rect = svgEl('rect', {
+        x: x(s), y: BAND_T, width: x(s + SIZE) - x(s), height: BAND_B - BAND_T,
+        rx: 6, class: 'band' + (w ? ' active' : '') + (w && w.closed ? ' closed' : '')
+      });
+      if (w && w.closed) rect.setAttribute('fill', 'url(#hatch)');
+      g.appendChild(rect);
+      const lbl = svgEl('text', { x: x(s) + 6, y: BAND_T + 14, class: 'band-label' });
+      lbl.textContent = '[' + s + ',' + (s + SIZE) + ')';
+      g.appendChild(lbl);
+      if (w && w.closed) {
+        const ck = svgEl('text', { x: x(s + SIZE) - 8, y: BAND_T + 14,
+          class: 'closed-check', 'text-anchor': 'end' });
+        ck.textContent = '✓ 已关闭';
+        g.appendChild(ck);
+      } else if (w) {
+        const n = w.pairs.length;
+        if (n > 0) {
+          const pb = svgEl('text', { x: x(s + SIZE) - 8, y: BAND_T + 14,
+            class: 'band-label', 'text-anchor': 'end' });
+          pb.textContent = n + ' 对暂存';
+          g.appendChild(pb);
+        }
+      }
+      if (f.window.start === s && !f.late) rect.setAttribute('class', rect.getAttribute('class') + ' target');
+      svg.appendChild(g);
+    }
+
+    // 网格线与刻度
+    for (let t = 0; t <= 50; t += 10) {
+      svg.appendChild(svgEl('line', { x1: x(t), y1: BAND_T - 8, x2: x(t), y2: BAND_B + 8, class: 'gridline' }));
+      const tk = svgEl('text', { x: x(t), y: BAND_T - 12, class: 'tick-label', 'text-anchor': 'middle' });
+      tk.textContent = t;
+      svg.appendChild(tk);
+    }
+    svg.appendChild(svgEl('line', { x1: ML, y1: BAND_B + 10, x2: VB_W - MR, y2: BAND_B + 10, class: 'axisline' }));
+    const tl = svgEl('text', { x: ML, y: 30, class: 'tick-label' });
+    tl.textContent = '事件时间 t →';
+    svg.appendChild(tl);
+
+    // 泳道标签
+    const ll = svgEl('text', { x: 8, y: LY + 4, class: 'lane-label' });
+    ll.textContent = 'L';
+    svg.appendChild(ll);
+    const rl = svgEl('text', { x: 8, y: RY + 4, class: 'lane-label' });
+    rl.textContent = 'R';
+    svg.appendChild(rl);
+
+    // Watermark（translate 过渡动画）——先于事件绘制，避免虚线压住圆点。
+    const wmX = x(f.watermarkAfter);
+    const wg = svgEl('g', { class: 'wm-g', transform: 'translate(' + wmX + ',0)' });
+    wg.appendChild(svgEl('line', { x1: 0, y1: 36, x2: 0, y2: BAND_B + 4, class: 'wm-line' }));
+    const tagBg = svgEl('rect', { x: -30, y: 22, width: 60, height: 17, rx: 8,
+      fill: 'var(--surface)', stroke: 'var(--wm)', 'stroke-width': 1 });
+    wg.appendChild(tagBg);
+    const tag = svgEl('text', { x: 0, y: 34.5, class: 'wm-tag', 'text-anchor': 'middle' });
+    tag.textContent = 'WM ' + f.watermarkAfter;
+    wg.appendChild(tag);
+    svg.appendChild(wg);
+
+    // 已到达事件（含当前帧）
+    const arrived = F.slice(0, cur + 1).map(fr => fr.event);
+    const arrivedSet = new Set(arrived.map(e => e.seq));
+    const px = layoutEvents(arrived);
+
+    // 配对连线（取当前帧所有窗口状态中的 pairs）
+    f.windows.forEach(w => {
+      w.pairs.forEach(p => {
+        if (!arrivedSet.has(p.left.seq) || !arrivedSet.has(p.right.seq)) return;
+        const x1 = px[p.left.seq], x2 = px[p.right.seq];
+        const path = svgEl('path', {
+          d: 'M' + x1 + ',' + LY + ' Q' + ((x1 + x2) / 2) + ',132 ' + x2 + ',' + RY,
+          class: 'pair-line ' + (w.closed ? 'emitted' : 'open')
+        });
+        svg.appendChild(path);
+      });
+    });
+
+    // 事件圆点
+    const lateSeq = new Set(f.lateEvents.map(l => l.event.seq));
+    arrived.forEach(e => {
+      const cy = e.side === 'L' ? LY : RY;
+      const cx = px[e.seq];
+      const isLate = lateSeq.has(e.seq);
+      const isCur = e.seq === f.event.seq;
+      if (isCur) {
+        svg.appendChild(svgEl('circle', { cx, cy, r: 12, class: 'cur-ring' + (isLate ? '' : ' normal') }));
+      }
+      const c = svgEl('circle', {
+        cx, cy, r: 11,
+        class: 'ev-circle' + (isLate ? ' late' : ''),
+        fill: isLate ? '' : (e.side === 'L' ? 'var(--left)' : 'var(--right)')
+      });
+      svg.appendChild(c);
+      const k = svgEl('text', { x: cx, y: cy, class: 'ev-key' + (isLate ? ' late' : ''),
+        fill: isLate ? '' : (e.side === 'L' ? '#fff' : '#201505') });
+      k.textContent = e.key;
+      svg.appendChild(k);
+      const tt = svgEl('text', { x: cx, y: cy + 24, class: 'ev-t' });
+      tt.textContent = e.time;
+      svg.appendChild(tt);
+    });
+
+    // 侧输出轨道
+    svg.appendChild(svgEl('line', { x1: ML, y1: RAIL_Y + 11, x2: VB_W - MR, y2: RAIL_Y + 11, class: 'rail-line' }));
+    const rlbl = svgEl('text', { x: 8, y: RAIL_Y + 15, class: 'rail-label' });
+    rlbl.textContent = '侧输出';
+    svg.appendChild(rlbl);
+    f.lateEvents.forEach((l, i) => {
+      const cx = ML + 92 + i * 118;
+      const chip = svgEl('rect', { x: cx - 46, y: RAIL_Y, width: 92, height: 22, rx: 11, class: 'rail-chip' });
+      svg.appendChild(chip);
+      const t1 = svgEl('text', { x: cx, y: RAIL_Y + 11.5, class: 'rail-chip-text' });
+      t1.textContent = l.event.side + '·' + l.event.key + '@' + l.event.time;
+      svg.appendChild(t1);
+      // 从迟到事件到轨道的箭头（仅当前帧迟到时）
+      if (f.late && l.event.seq === f.event.seq) {
+        const ex = px[l.event.seq], ey = (l.event.side === 'L' ? LY : RY) + 12;
+        svg.appendChild(svgEl('path', {
+          d: 'M' + ex + ',' + ey + ' C' + ex + ',' + (RAIL_Y - 18) + ' ' + (cx - 30) + ',' + (RAIL_Y - 8) + ' ' + (cx - 44) + ',' + RAIL_Y + 4,
+          class: 'rail-arrow'
+        }));
+      }
+    });
+  }
+
+  // ---------- 渲染：文字叙事 ----------
+  function findCloseWM(start) {
+    for (let i = cur - 1; i >= 0; i--) {
+      const c = F[i].closed.find(c => c.window.start === start);
+      if (c) return c.watermark;
+    }
+    return null;
+  }
+
+  function renderNarrative() {
+    const f = F[cur];
+    const box = $('narrative');
+    box.innerHTML = '';
+    const title = document.createElement('div');
+    title.className = 'frame-title';
+    title.textContent = '帧 ' + f.index + ' / ' + N + '：到达 ' +
+      (f.event.side === 'L' ? '左流' : '右流') + '事件  Key=' + f.event.key + '，t=' + f.event.time;
+    box.appendChild(title);
+
+    const wmRow = document.createElement('div');
+    wmRow.className = 'row';
+    wmRow.innerHTML = '<span class="tag">Watermark</span><span class="mono">' +
+      fmtWM(f.watermarkBefore) + ' → ' + f.watermarkAfter + '</span>';
+    const b = document.createElement('span');
+    b.className = 'badge ' + (f.advanced ? 'adv' : 'stay');
+    b.textContent = f.advanced ? '推进' : '保持不变';
+    wmRow.appendChild(b);
+    box.appendChild(wmRow);
+
+    const asg = document.createElement('div');
+    asg.className = 'row';
+    asg.innerHTML = '<span class="tag">窗口分配</span><span class="mono">t=' + f.event.time +
+      ' ∈ ' + wkey(f.window) + '</span>';
+    box.appendChild(asg);
+
+    if (f.late) {
+      const lb = document.createElement('div');
+      lb.className = 'late-box';
+      const closeWM = findCloseWM(f.window.start);
+      lb.textContent = closeWM !== null
+        ? '⚠ 迟到：' + wkey(f.window) + ' 已在 WM=' + closeWM + ' 时关闭并输出，事件改道侧输出'
+        : '⚠ 迟到：WM=' + f.watermarkAfter + ' 已越过 ' + wkey(f.window) +
+          ' 的 End=' + f.window.end + '（该窗口从未开启），事件进入侧输出';
+      box.appendChild(lb);
+    } else if (f.newPairs.length) {
+      const pr = document.createElement('div');
+      pr.className = 'row';
+      pr.innerHTML = '<span class="tag">配对暂存</span>';
+      const chips = document.createElement('div');
+      chips.className = 'chips';
+      f.newPairs.forEach(p => {
+        const c = document.createElement('span');
+        c.className = 'chip';
+        c.innerHTML = '<i class="dot L"></i>' + p.left.time +
+          ' ⨝ <i class="dot R"></i>' + p.right.time + ' <span class="mono">(key=' + p.left.key + ')</span>';
+        chips.appendChild(c);
+      });
+      pr.appendChild(chips);
+      box.appendChild(pr);
+    } else {
+      const no = document.createElement('div');
+      no.className = 'row';
+      no.innerHTML = '<span class="tag">配对</span><span class="empty">对侧流暂无同 Key 事件，仅缓冲</span>';
+      box.appendChild(no);
+    }
+
+    f.closed.forEach(c => {
+      const cb = document.createElement('div');
+      cb.className = 'close-box';
+      cb.innerHTML = '✓ <b>WM=' + c.watermark + ' ≥ End=' + c.window.end +
+        '</b>，关闭窗口 <span class="mono">' + wkey(c.window) + '</span>，正式输出 <b>' +
+        c.results.length + '</b> 条 Join 结果';
+      box.appendChild(cb);
+    });
+  }
+
+  // ---------- 渲染：窗口状态 / 结果 / 侧输出 ----------
+  function eventChip(e) {
+    const c = document.createElement('span');
+    c.className = 'chip';
+    c.innerHTML = '<i class="dot ' + e.side + '"></i>' + e.key + '@' + e.time;
+    return c;
+  }
+
+  function renderPanels() {
+    const f = F[cur];
+
+    const winBox = $('windows');
+    winBox.innerHTML = '';
+    $('win-count').textContent = f.windows.length + ' 个';
+    if (!f.windows.length) {
+      winBox.innerHTML = '<div class="empty">尚无窗口</div>';
+    }
+    f.windows.forEach(w => {
+      const card = document.createElement('div');
+      card.className = 'win-card' + (w.closed ? ' closed' : '');
+      const head = document.createElement('div');
+      head.className = 'win-head';
+      head.innerHTML = '<span class="mono">' + wkey(w.window) + '</span>';
+      const st = document.createElement('span');
+      st.className = 'st' + (w.closed ? ' closed' : '');
+      st.textContent = w.closed ? '✓ 已关闭（WM=' + closedWMOf(w.window.start) + '）' : '开放中';
+      head.appendChild(st);
+      card.appendChild(head);
+
+      const ll = document.createElement('div');
+      ll.className = 'win-line';
+      ll.innerHTML = '<span class="lbl">L</span>';
+      const lc = document.createElement('div');
+      lc.className = 'chips';
+      w.left.forEach(e => lc.appendChild(eventChip(e)));
+      if (!w.left.length) lc.innerHTML = '<span class="empty">—</span>';
+      ll.appendChild(lc);
+      card.appendChild(ll);
+
+      const rr = document.createElement('div');
+      rr.className = 'win-line';
+      rr.innerHTML = '<span class="lbl">R</span>';
+      const rc = document.createElement('div');
+      rc.className = 'chips';
+      w.right.forEach(e => rc.appendChild(eventChip(e)));
+      if (!w.right.length) rc.innerHTML = '<span class="empty">—</span>';
+      rr.appendChild(rc);
+      card.appendChild(rr);
+
+      const pl = document.createElement('div');
+      pl.className = 'pairline';
+      pl.innerHTML = w.pairs.length
+        ? '配对 <b>' + w.pairs.length + '</b>：' +
+          w.pairs.map(p => p.left.time + '⨝' + p.right.time).join('，')
+        : '配对 0';
+      card.appendChild(pl);
+      winBox.appendChild(card);
+    });
+
+    // Join 结果（累计）
+    const resBox = $('results');
+    resBox.innerHTML = '';
+    $('res-count').textContent = f.results.length + ' 条';
+    f.results.forEach(p => {
+      const c = document.createElement('span');
+      c.className = 'chip result';
+      c.innerHTML = '<span class="mono">[' + p.window.start + ')</span> ' +
+        p.left.key + ': <i class="dot L"></i>' + p.left.time +
+        ' ⨝ <i class="dot R"></i>' + p.right.time;
+      resBox.appendChild(c);
+    });
+    if (!f.results.length) resBox.innerHTML = '<span class="empty">尚无结果（窗口关闭时才正式输出）</span>';
+
+    // 侧输出（累计）
+    const lateBox = $('side-output');
+    lateBox.innerHTML = '';
+    $('late-count').textContent = f.lateEvents.length + ' 条';
+    f.lateEvents.forEach(l => {
+      const c = document.createElement('span');
+      c.className = 'chip late';
+      c.textContent = '⚠ ' + l.event.side + '·' + l.event.key + '@' + l.event.time +
+        ' → [' + l.window.start + ')';
+      lateBox.appendChild(c);
+    });
+    if (!f.lateEvents.length) lateBox.innerHTML = '<span class="empty">暂无迟到数据</span>';
+
+    // 顶部统计
+    $('st-wm').textContent = f.watermarkAfter;
+    $('st-res').textContent = f.results.length;
+    $('st-late').textContent = f.lateEvents.length;
+    const closedCount = F.slice(0, cur + 1).reduce((n, fr) => n + fr.closed.length, 0);
+    $('st-closed').textContent = closedCount;
+    $('stat-late').classList.toggle('alert', f.late);
+    $('late-banner').classList.toggle('show', f.late);
+    $('chart-card').classList.toggle('is-late', f.late);
+  }
+
+  function closedWMOf(start) {
+    for (let i = cur; i >= 0; i--) {
+      const c = F[i].closed.find(c => c.window.start === start);
+      if (c) return c.watermark;
+    }
+    return '?';
+  }
+
+  // ---------- 帧日志 ----------
+  function renderLog() {
+    const box = $('framelog');
+    box.innerHTML = '';
+    F.forEach((fr, i) => {
+      const btn = document.createElement('button');
+      btn.type = 'button';
+      btn.className = 'fl-item' + (i === cur ? ' cur' : '') + (fr.late ? ' late' : '');
+      let detail;
+      if (fr.late) detail = '⚠ 迟到→侧输出';
+      else if (fr.closed.length) detail = '关闭 ' + fr.closed.map(c => '[' + c.window.start + ')').join(' ');
+      else if (fr.newPairs.length) detail = '+' + fr.newPairs.length + ' 配对';
+      else detail = '缓冲';
+      btn.innerHTML = '<span class="n">#' + fr.index + '</span>' +
+        '<span>' + fr.event.side + '·' + fr.event.key + '@' + fr.event.time + '</span>' +
+        '<span class="d">' + detail + ' · WM ' + fr.watermarkAfter + '</span>';
+      btn.addEventListener('click', () => { stop(); seek(i); });
+      box.appendChild(btn);
+    });
+    const curBtn = box.children[cur];
+    // 只在日志容器内部跟随当前帧，不带动整页滚动。
+    if (curBtn) {
+      const top = curBtn.offsetTop - box.offsetTop;
+      const bottom = top + curBtn.offsetHeight;
+      if (top < box.scrollTop) box.scrollTop = top - 4;
+      else if (bottom > box.scrollTop + box.clientHeight) box.scrollTop = bottom - box.clientHeight + 4;
+    }
+  }
+
+  // ---------- 控制 ----------
+  function render() {
+    renderChart();
+    renderNarrative();
+    renderPanels();
+    renderLog();
+    $('slider').value = cur + 1;
+    $('frame-label').textContent = '帧 ' + (cur + 1) + ' / ' + N;
+    history.replaceState(null, '', '?frame=' + (cur + 1) +
+      '&theme=' + document.documentElement.dataset.theme);
+  }
+  function seek(i) {
+    cur = Math.max(0, Math.min(N - 1, i));
+    render();
+  }
+  function tick() {
+    if (cur >= N - 1) { stop(); return; }
+    seek(cur + 1);
+  }
+  function play() {
+    playing = true;
+    $('btn-play').textContent = '⏸ 暂停';
+    const ms = BASE_MS / parseFloat($('speed').value);
+    timer = setInterval(tick, ms);
+  }
+  function stop() {
+    playing = false;
+    $('btn-play').textContent = '▶ 播放';
+    if (timer) { clearInterval(timer); timer = null; }
+  }
+
+  $('btn-play').addEventListener('click', () => (playing ? stop() : play()));
+  $('btn-first').addEventListener('click', () => { stop(); seek(0); });
+  $('btn-prev').addEventListener('click', () => { stop(); seek(cur - 1); });
+  $('btn-next').addEventListener('click', () => { stop(); seek(cur + 1); });
+  $('btn-last').addEventListener('click', () => { stop(); seek(N - 1); });
+  $('slider').addEventListener('input', e => { stop(); seek(parseInt(e.target.value, 10) - 1); });
+  $('speed').addEventListener('change', () => { if (playing) { stop(); play(); } });
+  document.addEventListener('keydown', e => {
+    if (e.target.tagName === 'SELECT' || e.target.tagName === 'INPUT') return;
+    if (e.code === 'Space') { e.preventDefault(); playing ? stop() : play(); }
+    else if (e.code === 'ArrowLeft') { stop(); seek(cur - 1); }
+    else if (e.code === 'ArrowRight') { stop(); seek(cur + 1); }
+  });
+  $('theme-btn').addEventListener('click', () => {
+    const root = document.documentElement;
+    root.dataset.theme = root.dataset.theme === 'dark' ? 'light' : 'dark';
+    updateThemeBtn();
+    render();
+  });
+  function updateThemeBtn() {
+    $('theme-btn').textContent = document.documentElement.dataset.theme === 'dark' ? '☀️ 亮色' : '🌙 暗色';
+  }
+
+  // ---------- 初始化 ----------
+  $('cfg-size').textContent = SIZE;
+  $('cfg-tol').textContent = TOL;
+  $('cfg-frames').textContent = N;
+  $('slider').max = N;
+  updateThemeBtn();
+  const qf = parseInt(new URLSearchParams(location.search).get('frame'), 10);
+  seek(Number.isFinite(qf) ? qf - 1 : 0);
+})();
+</script>
+</body>
+</html>
